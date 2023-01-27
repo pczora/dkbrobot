@@ -14,12 +14,18 @@ func main() {
 	var password string
 
 	fmt.Printf("Username: ")
-	fmt.Scanf("%s", &username)
+	_, err := fmt.Scanf("%s", &username)
+	if err != nil {
+		panic(err)
+	}
+
 	fmt.Printf("Password: ")
 	bytepw, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
 		os.Exit(1)
 	}
+	fmt.Print("\n")
+
 	password = string(bytepw)
 
 	c := dkbclient.New()

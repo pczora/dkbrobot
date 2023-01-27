@@ -83,10 +83,12 @@ func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) er
 	pollUrl := "https://www.dkb.de" + confirmFormAction
 
 	for i := 0; i < 60; i++ {
+
 		pollId += 1
-		url := pollUrl + "?$event=pollingVerification&$ignore.request=true&_=" + strconv.Itoa(int(pollId))
-		fmt.Printf("polling: %v\n", url)
-		resp, _ := c.httpClient.Get(url)
+
+		fullPollUrl := pollUrl + "?$event=pollingVerification&$ignore.request=true&_=" + strconv.Itoa(int(pollId))
+
+		resp, _ := c.httpClient.Get(fullPollUrl)
 
 		bytes, _ := io.ReadAll(resp.Body)
 
