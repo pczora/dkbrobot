@@ -1,9 +1,14 @@
 package dkbclient
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/gocarina/gocsv"
+	"golang.org/x/text/encoding/charmap"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,6 +17,15 @@ import (
 	"strings"
 	"time"
 )
+
+func init() {
+	gocsv.SetCSVReader(func(in io.Reader) gocsv.CSVReader {
+		// DKB uses ISO8859-15 (for whatever reason)
+		reader := csv.NewReader(charmap.ISO8859_15.NewDecoder().Reader(in))
+		reader.Comma = ';'
+		return reader
+	})
+}
 
 type Client struct {
 	httpClient *http.Client
@@ -90,10 +104,10 @@ func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) er
 
 		resp, _ := c.httpClient.Get(fullPollUrl)
 
-		bytes, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(resp.Body)
 
 		bodyJson := make(map[string]string)
-		err := json.Unmarshal(bytes, &bodyJson)
+		err := json.Unmarshal(b, &bodyJson)
 		if err != nil {
 			return err
 		}
@@ -169,7 +183,7 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 				link := col.Find("a.evt-paymentTransaction")
 				if len(link.Nodes) > 0 {
 					if strings.HasPrefix(account, "DE") {
-						accountType = "Account"
+						accountType = "account"
 					} else {
 						accountType = "credit card"
 					}
@@ -195,18 +209,97 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 	return result, nil
 }
 
-func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to time.Time) (string, error) {
+type DkbDateTime struct {
+	time.Time
+}
+
+func (date *DkbDateTime) MarshalCSV() (string, error) {
+	return date.Time.Format("02.01.2006"), nil
+}
+
+func (date *DkbDateTime) UnmarshalCSV(csv string) (err error) {
+	t, err := time.Parse("02.01.2006", csv)
+	date.Time = t
+	return err
+}
+
+type DkbAmount struct {
+	float64
+}
+
+func (amount *DkbAmount) MarshalCSV() (string, error) {
+	return strconv.FormatFloat(amount.float64, 'f', 2, 64), nil
+}
+
+func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
+	normalizedAmount := amount.normalizeAmount(csv)
+	floatAmount, err := strconv.ParseFloat(normalizedAmount, 64)
+	if err != nil {
+		return err
+	}
+	amount.float64 = floatAmount
+	return nil
+}
+
+func (amount *DkbAmount) normalizeAmount(a string) string {
+	result := strings.Replace(a, ".", "", -1)
+	result = strings.Replace(result, ",", ".", -1)
+	return result
+}
+
+type AccountTransaction struct {
+	Date              DkbDateTime `csv:"Buchungstag"`
+	ValueDate         DkbDateTime `csv:"Wertstellung"`
+	PostingText       string      `csv:"Buchungstext"`
+	Payee             string      `csv:"Auftraggeber / Begünstigter"`
+	Purpose           string      `csv:"Verwendungszweck"`
+	BankAccountNumber string      `csv:"Kontonummer"`
+	BankCode          string      `csv:"Bankleitzahl"`
+	Amount            DkbAmount   `csv:"Betrag (EUR)"`
+	CreditorID        string      `csv:"Gläubiger-ID"`
+	MandateReference  string      `csv:"Mandatsreferenz"`
+	CustomerReference string      `csv:"Kundenreferenz"`
+}
+
+type CreditCardTransaction struct {
+	Marked    string      `csv:"Umsatz abgerechnet aber nicht im Saldo enthalten"` // Ignored (for now)
+	ValueDate DkbDateTime `csv:"Wertstellung"`
+	Date      DkbDateTime `csv:"Belegdatum"`
+	Purpose   string      `csv:"Beschreibung"`
+	Amount    DkbAmount   `csv:"Betrag (EUR)"`
+	//OriginalAmount DkbAmount   `csv:"Ursprünglicher Betrag"` // Ignored (for now)
+}
+
+func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to time.Time) ([]AccountTransaction, error) {
+	result, err := c.getTransactions(a, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.parseAccountTransactions(result)
+}
+
+func (c *Client) GetCreditCardTransactions(a AccountOverview, from time.Time, to time.Time) ([]CreditCardTransaction, error) {
+	result, err := c.getTransactions(a, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.parseCreditCardTransactions(result)
+}
+
+func (c *Client) getTransactions(a AccountOverview, from time.Time, to time.Time) ([]byte, error) {
 	resp, err := c.httpClient.Get("https://www.dkb.de" + a.TransactionLink)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	d, err := goquery.NewDocumentFromReader(resp.Body)
 
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	accountNumber, _ := d.Find("select#id-1615473160_slAllAccounts option[selected='selected']").Attr("value")
+	accountNumber, _ := d.Find("select[name='slAllAccounts'] option[selected='selected']").Attr("value")
 
 	postUrl := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze"
 	postData := url.Values{}
@@ -218,12 +311,10 @@ func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to ti
 	postData.Add("$event", "search")
 	postData.Add("slAllAccounts", accountNumber)
 
-	fmt.Println(postData)
-
 	resp, err = c.httpClient.PostForm(postUrl, postData)
 
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	resp, err = c.httpClient.Get("https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport")
@@ -231,8 +322,41 @@ func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to ti
 	result, err := io.ReadAll(resp.Body)
 
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	return result, nil
+}
+
+func (c *Client) parseAccountTransactions(transactions []byte) ([]AccountTransaction, error) {
+	var result []AccountTransaction
+
+	r := bufio.NewReader(bytes.NewReader(transactions))
+	skipLines(r, 6) // First six lines consist of metadata
+
+	err := gocsv.Unmarshal(r, &result)
+	if err != nil {
+		return nil, err
 	}
 
-	return string(result), nil
+	return result, nil
+}
+
+func (c *Client) parseCreditCardTransactions(transactions []byte) ([]CreditCardTransaction, error) {
+	var result []CreditCardTransaction
+
+	r := bufio.NewReader(bytes.NewReader(transactions))
+	skipLines(r, 6) // First six lines consist of metadata
+
+	err := gocsv.Unmarshal(r, &result)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func skipLines(r *bufio.Reader, n int) {
+	for i := 0; i < n; i++ {
+		r.ReadLine()
+	}
 }

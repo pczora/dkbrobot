@@ -45,15 +45,24 @@ func main() {
 			continue
 		}
 
-		transactions, err := c.GetAccountTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
-		if err != nil {
-			panic(err)
+		if a.AccountType == "account" {
+			transactions, err := c.GetAccountTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
+			if err != nil {
+				panic(err)
+			}
+			for _, transaction := range transactions {
+				fmt.Println(transaction)
+			}
+		} else if a.AccountType == "credit card" {
+			transactions, err := c.GetCreditCardTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
+			if err != nil {
+				panic(err)
+			}
+			for _, transaction := range transactions {
+				fmt.Printf("%+v\n", transaction)
+			}
 		}
 
-		err = os.WriteFile(a.Account+".csv", []byte(transactions), os.ModePerm)
-		if err != nil {
-			panic(err)
-		}
 	}
 
 }
