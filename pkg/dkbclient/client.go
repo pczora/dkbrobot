@@ -6,9 +6,6 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/gocarina/gocsv"
-	"golang.org/x/text/encoding/charmap"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -16,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/gocarina/gocsv"
+	"golang.org/x/text/encoding/charmap"
 )
 
 func init() {
@@ -27,19 +28,35 @@ func init() {
 	})
 }
 
+// Client is an HTTP client for the DKB web interface
 type Client struct {
 	httpClient *http.Client
 }
 
-type AccountOverview struct {
+// AccountMetadata represents some metadata about a (financial) account as part
+// of a user's DKB account
+type AccountMetadata struct {
 	AccountName     string
 	Account         string
 	Date            string
 	Amount          string
-	AccountType     string
+	AccountType     AccountType
 	TransactionLink string
 }
 
+// AccountType determines the type of an account
+type AccountType int64
+
+const (
+	// CheckingAccount represents a checking account
+	CheckingAccount AccountType = iota
+	// Depot represents a stock share depot
+	Depot
+	// CreditCard represents a credit card
+	CreditCard
+)
+
+// New creates a new Client
 func New() Client {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -54,6 +71,7 @@ func New() Client {
 	return Client{httpClient: httpClient}
 }
 
+// Login logs in to the DKB website using the provided credentials
 func (c *Client) Login(username, password string) error {
 
 	resp, err := c.httpClient.Get("https://www.dkb.de/banking")
@@ -93,26 +111,26 @@ func (c *Client) Login(username, password string) error {
 
 func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) error {
 
-	pollId := time.Now().UTC().UnixMilli() * 1000
-	pollUrl := "https://www.dkb.de" + confirmFormAction
+	pollID := time.Now().UTC().UnixMilli() * 1000
+	pollURL := "https://www.dkb.de" + confirmFormAction
 
 	for i := 0; i < 60; i++ {
 
-		pollId += 1
+		pollID++
 
-		fullPollUrl := pollUrl + "?$event=pollingVerification&$ignore.request=true&_=" + strconv.Itoa(int(pollId))
+		fullPollURL := pollURL + "?$event=pollingVerification&$ignore.request=true&_=" + strconv.Itoa(int(pollID))
 
-		resp, _ := c.httpClient.Get(fullPollUrl)
+		resp, _ := c.httpClient.Get(fullPollURL)
 
 		b, _ := io.ReadAll(resp.Body)
 
-		bodyJson := make(map[string]string)
-		err := json.Unmarshal(b, &bodyJson)
+		bodyJSON := make(map[string]string)
+		err := json.Unmarshal(b, &bodyJSON)
 		if err != nil {
 			return err
 		}
 
-		if bodyJson["state"] == "PROCESSED" {
+		if bodyJSON["state"] == "PROCESSED" {
 			fmt.Println("success")
 			break
 		}
@@ -129,7 +147,7 @@ func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) er
 	postData.Add("$event", "next")
 	postData.Add("XSRFPreventionToken", xsrfToken)
 
-	resp, err := c.httpClient.PostForm(pollUrl, postData)
+	resp, err := c.httpClient.PostForm(pollURL, postData)
 	if err != nil {
 		return err
 	}
@@ -139,7 +157,9 @@ func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) er
 	return nil
 }
 
-func (c *Client) ParseOverview() ([]AccountOverview, error) {
+// ParseOverview parses the financial over view status page on the DKB website
+// and returns a slice containing data about each parsed account
+func (c *Client) ParseOverview() ([]AccountMetadata, error) {
 	resp, err := c.httpClient.Get("https://www.dkb.de/DkbTransactionBanking/content/banking/financialstatus/FinancialComposite/FinancialStatus.xhtml?$event=init")
 	if err != nil {
 		return nil, err
@@ -153,7 +173,7 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 
 	rows := d.Find("tr.mainRow")
 
-	var result []AccountOverview
+	var result []AccountMetadata
 
 	rows.Each(func(i int, row *goquery.Selection) {
 		var (
@@ -161,7 +181,7 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 			account         string
 			date            string
 			amount          string
-			accountType     string
+			accountType     AccountType
 			transactionLink string
 		)
 		cols := row.Find("td")
@@ -183,21 +203,21 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 				link := col.Find("a.evt-paymentTransaction")
 				if len(link.Nodes) > 0 {
 					if strings.HasPrefix(account, "DE") {
-						accountType = "account"
+						accountType = CheckingAccount
 					} else {
-						accountType = "credit card"
+						accountType = CreditCard
 					}
 
 					transactionLink, _ = link.Attr("href")
 				} else {
-					accountType = "depot"
+					accountType = Depot
 					transactionLink, _ = col.Find("a.evt-depot").Attr("href")
 				}
 				break
 			default:
 			}
 		})
-		result = append(result, AccountOverview{
+		result = append(result, AccountMetadata{
 			AccountName:     accountName,
 			Account:         account,
 			Date:            date,
@@ -209,28 +229,34 @@ func (c *Client) ParseOverview() ([]AccountOverview, error) {
 	return result, nil
 }
 
-type DkbDateTime struct {
+// DkbTime represents a time format which is used by the DKB
+type DkbTime struct {
 	time.Time
 }
 
-func (date *DkbDateTime) MarshalCSV() (string, error) {
-	return date.Time.Format("02.01.2006"), nil
+// MarshalCSV marshals DkbTime object to CSV
+func (date *DkbTime) MarshalCSV() (string, error) {
+	return date.Format("02.01.2006"), nil
 }
 
-func (date *DkbDateTime) UnmarshalCSV(csv string) (err error) {
+// UnmarshalCSV unmarshals DkbTime from CSV
+func (date *DkbTime) UnmarshalCSV(csv string) (err error) {
 	t, err := time.Parse("02.01.2006", csv)
 	date.Time = t
 	return err
 }
 
+// DkbAmount represents an amount of money as formatted by the DKB website
 type DkbAmount struct {
 	float64
 }
 
+// MarshalCSV marshals DkbAmount to CSV
 func (amount *DkbAmount) MarshalCSV() (string, error) {
 	return strconv.FormatFloat(amount.float64, 'f', 2, 64), nil
 }
 
+// UnmarshalCSV unmarshals CSV to DkbAmount
 func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
 	normalizedAmount := amount.normalizeAmount(csv)
 	floatAmount, err := strconv.ParseFloat(normalizedAmount, 64)
@@ -242,35 +268,39 @@ func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
 }
 
 func (amount *DkbAmount) normalizeAmount(a string) string {
-	result := strings.Replace(a, ".", "", -1)
-	result = strings.Replace(result, ",", ".", -1)
+	result := strings.ReplaceAll(a, ".", "")
+	result = strings.ReplaceAll(result, ",", ".")
 	return result
 }
 
+// AccountTransaction represents a transaction in a DKB checking account
 type AccountTransaction struct {
-	Date              DkbDateTime `csv:"Buchungstag"`
-	ValueDate         DkbDateTime `csv:"Wertstellung"`
-	PostingText       string      `csv:"Buchungstext"`
-	Payee             string      `csv:"Auftraggeber / Begünstigter"`
-	Purpose           string      `csv:"Verwendungszweck"`
-	BankAccountNumber string      `csv:"Kontonummer"`
-	BankCode          string      `csv:"Bankleitzahl"`
-	Amount            DkbAmount   `csv:"Betrag (EUR)"`
-	CreditorID        string      `csv:"Gläubiger-ID"`
-	MandateReference  string      `csv:"Mandatsreferenz"`
-	CustomerReference string      `csv:"Kundenreferenz"`
+	Date              DkbTime   `csv:"Buchungstag"`
+	ValueDate         DkbTime   `csv:"Wertstellung"`
+	PostingText       string    `csv:"Buchungstext"`
+	Payee             string    `csv:"Auftraggeber / Begünstigter"`
+	Purpose           string    `csv:"Verwendungszweck"`
+	BankAccountNumber string    `csv:"Kontonummer"`
+	BankCode          string    `csv:"Bankleitzahl"`
+	Amount            DkbAmount `csv:"Betrag (EUR)"`
+	CreditorID        string    `csv:"Gläubiger-ID"`
+	MandateReference  string    `csv:"Mandatsreferenz"`
+	CustomerReference string    `csv:"Kundenreferenz"`
 }
 
+// CreditCardTransaction represents a transaction in a DKB credit card account
 type CreditCardTransaction struct {
-	Marked    string      `csv:"Umsatz abgerechnet aber nicht im Saldo enthalten"` // Ignored (for now)
-	ValueDate DkbDateTime `csv:"Wertstellung"`
-	Date      DkbDateTime `csv:"Belegdatum"`
-	Purpose   string      `csv:"Beschreibung"`
-	Amount    DkbAmount   `csv:"Betrag (EUR)"`
+	Marked    string    `csv:"Umsatz abgerechnet aber nicht im Saldo enthalten"` // Ignored (for now)
+	ValueDate DkbTime   `csv:"Wertstellung"`
+	Date      DkbTime   `csv:"Belegdatum"`
+	Purpose   string    `csv:"Beschreibung"`
+	Amount    DkbAmount `csv:"Betrag (EUR)"`
 	//OriginalAmount DkbAmount   `csv:"Ursprünglicher Betrag"` // Ignored (for now)
 }
 
-func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to time.Time) ([]AccountTransaction, error) {
+// GetAccountTransactions returns all transactions in the checking account identified
+// by the provided AccountMetadata between the `from` and `to` times
+func (c *Client) GetAccountTransactions(a AccountMetadata, from time.Time, to time.Time) ([]AccountTransaction, error) {
 	result, err := c.getTransactions(a, from, to)
 	if err != nil {
 		return nil, err
@@ -279,7 +309,9 @@ func (c *Client) GetAccountTransactions(a AccountOverview, from time.Time, to ti
 	return c.parseAccountTransactions(result)
 }
 
-func (c *Client) GetCreditCardTransactions(a AccountOverview, from time.Time, to time.Time) ([]CreditCardTransaction, error) {
+// GetCreditCardTransactions returns all transactions in the credit card account
+// identified by the provided AccountMetadata between the `from` and `to` times
+func (c *Client) GetCreditCardTransactions(a AccountMetadata, from time.Time, to time.Time) ([]CreditCardTransaction, error) {
 	result, err := c.getTransactions(a, from, to)
 	if err != nil {
 		return nil, err
@@ -288,7 +320,7 @@ func (c *Client) GetCreditCardTransactions(a AccountOverview, from time.Time, to
 	return c.parseCreditCardTransactions(result)
 }
 
-func (c *Client) getTransactions(a AccountOverview, from time.Time, to time.Time) ([]byte, error) {
+func (c *Client) getTransactions(a AccountMetadata, from time.Time, to time.Time) ([]byte, error) {
 	resp, err := c.httpClient.Get("https://www.dkb.de" + a.TransactionLink)
 	if err != nil {
 		return nil, err
@@ -301,7 +333,7 @@ func (c *Client) getTransactions(a AccountOverview, from time.Time, to time.Time
 	}
 	accountNumber, _ := d.Find("select[name='slAllAccounts'] option[selected='selected']").Attr("value")
 
-	postUrl := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze"
+	postURL := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze"
 	postData := url.Values{}
 	postData.Add("slTransactionStatus", "0")
 	postData.Add("slSearchPeriod", "1")
@@ -311,13 +343,17 @@ func (c *Client) getTransactions(a AccountOverview, from time.Time, to time.Time
 	postData.Add("$event", "search")
 	postData.Add("slAllAccounts", accountNumber)
 
-	resp, err = c.httpClient.PostForm(postUrl, postData)
+	resp, err = c.httpClient.PostForm(postURL, postData)
 
 	if err != nil {
 		return nil, err
 	}
 
 	resp, err = c.httpClient.Get("https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport")
+
+	if err != nil {
+		return nil, err
+	}
 
 	result, err := io.ReadAll(resp.Body)
 

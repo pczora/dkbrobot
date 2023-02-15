@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
-	"github.com/pczora/dkbgobot/pkg/dkbclient"
-	"golang.org/x/term"
 	"os"
 	"syscall"
 	"time"
+
+	"github.com/pczora/dkbgobot/pkg/dkbclient"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -20,7 +21,7 @@ func main() {
 	}
 
 	fmt.Printf("Password: ")
-	bytepw, err := term.ReadPassword(int(syscall.Stdin))
+	bytepw, err := term.ReadPassword(syscall.Stdin)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -41,11 +42,9 @@ func main() {
 	}
 
 	for _, a := range accounts {
-		if a.AccountType == "depot" {
+		if a.AccountType == dkbclient.Depot {
 			continue
-		}
-
-		if a.AccountType == "account" {
+		} else if a.AccountType == dkbclient.CheckingAccount {
 			transactions, err := c.GetAccountTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
 			if err != nil {
 				panic(err)
@@ -53,7 +52,7 @@ func main() {
 			for _, transaction := range transactions {
 				fmt.Println(transaction)
 			}
-		} else if a.AccountType == "credit card" {
+		} else if a.AccountType == dkbclient.CreditCard {
 			transactions, err := c.GetCreditCardTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
 			if err != nil {
 				panic(err)
