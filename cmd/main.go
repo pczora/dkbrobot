@@ -6,7 +6,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pczora/dkbgobot/pkg/dkbclient"
+	"github.com/pczora/dkbrobot/pkg/dkbclient"
 	"golang.org/x/term"
 )
 

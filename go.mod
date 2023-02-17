@@ -1,4 +1,4 @@
-module github.com/pczora/dkbgobot
+module github.com/pczora/dkbrobot
 
 go 1.19
 
