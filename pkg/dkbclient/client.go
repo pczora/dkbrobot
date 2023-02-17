@@ -230,30 +230,26 @@ func (c *Client) ParseOverview() ([]AccountMetadata, error) {
 }
 
 // DkbTime represents a time format which is used by the DKB
-type DkbTime struct {
-	time.Time
-}
+type DkbTime time.Time
 
 // MarshalCSV marshals DkbTime object to CSV
 func (date *DkbTime) MarshalCSV() (string, error) {
-	return date.Format("02.01.2006"), nil
+	return time.Time(*date).Format("02.01.2006"), nil
 }
 
 // UnmarshalCSV unmarshals DkbTime from CSV
 func (date *DkbTime) UnmarshalCSV(csv string) (err error) {
 	t, err := time.Parse("02.01.2006", csv)
-	date.Time = t
+	*date = DkbTime(t)
 	return err
 }
 
 // DkbAmount represents an amount of money as formatted by the DKB website
-type DkbAmount struct {
-	float64
-}
+type DkbAmount float64
 
 // MarshalCSV marshals DkbAmount to CSV
 func (amount *DkbAmount) MarshalCSV() (string, error) {
-	return strconv.FormatFloat(amount.float64, 'f', 2, 64), nil
+	return strconv.FormatFloat(float64(*amount), 'f', 2, 64), nil
 }
 
 // UnmarshalCSV unmarshals CSV to DkbAmount
@@ -263,7 +259,7 @@ func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
 	if err != nil {
 		return err
 	}
-	amount.float64 = floatAmount
+	*amount = DkbAmount(floatAmount)
 	return nil
 }
 
