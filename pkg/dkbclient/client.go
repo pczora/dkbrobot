@@ -345,7 +345,12 @@ func (c *Client) getTransactions(a AccountMetadata, from time.Time, to time.Time
 		return nil, err
 	}
 
-	resp, err = c.httpClient.Get("https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport")
+	// TODO: Clean this up
+	url := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport"
+	if a.AccountType == CreditCard {
+		url = "https://www.dkb.de/banking/finanzstatus/kreditkartenumsaetze?$event=csvExport"
+	}
+	resp, err = c.httpClient.Get(url)
 
 	if err != nil {
 		return nil, err
