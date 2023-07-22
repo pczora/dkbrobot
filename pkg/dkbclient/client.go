@@ -74,11 +74,14 @@ func New() Client {
 // Login logs in to the DKB website using the provided credentials
 func (c *Client) Login(username, password string) error {
 
-	resp, err := c.httpClient.Get("https://www.dkb.de/banking")
+	resp, err := c.httpClient.Get("https://www.ib.dkb.de/banking")
 	if err != nil {
 		panic(err)
 	}
 	d, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return fmt.Errorf("could not create document from reponse: %v", err)
+	}
 
 	sid, _ := d.Find("form#login input[name='$sID$']").Attr("value")
 	token, _ := d.Find("form#login input[name='token']").Attr("value")
@@ -90,7 +93,7 @@ func (c *Client) Login(username, password string) error {
 	data.Add("j_username", username)
 	data.Add("j_password", password)
 
-	resp, err = c.httpClient.PostForm("https://www.dkb.de/banking", data)
+	resp, err = c.httpClient.PostForm("https://www.ib.dkb.de/banking", data)
 	if err != nil {
 		return err
 	}
@@ -112,7 +115,7 @@ func (c *Client) Login(username, password string) error {
 func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) error {
 
 	pollID := time.Now().UTC().UnixMilli() * 1000
-	pollURL := "https://www.dkb.de" + confirmFormAction
+	pollURL := "https://www.ib.dkb.de" + confirmFormAction
 
 	for i := 0; i < 60; i++ {
 
