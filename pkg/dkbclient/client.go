@@ -67,7 +67,10 @@ func (c *Client) Login(username, password string) error {
 	}
 	mfaMethodResponse := MFAMethodsResponse{}
 
-	json.Unmarshal(buf.Bytes(), &mfaMethodResponse)
+	err = json.Unmarshal(buf.Bytes(), &mfaMethodResponse)
+	if err != nil {
+		return err
+	}
 
 	// TODO: Allow for selection of method to be used
 	recentMethod := getMostRecentlyEnrolledMFAMethod(mfaMethodResponse.Data)
