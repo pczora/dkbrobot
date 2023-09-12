@@ -1,9 +1,7 @@
 package dkbclient
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,23 +9,9 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
-	"github.com/gocarina/gocsv"
-	"golang.org/x/text/encoding/charmap"
 )
-
-func init() {
-	gocsv.SetCSVReader(func(in io.Reader) gocsv.CSVReader {
-		// DKB uses ISO8859-15 (for whatever reason)
-		reader := csv.NewReader(charmap.ISO8859_15.NewDecoder().Reader(in))
-		reader.Comma = ';'
-		return reader
-	})
-}
 
 // Client is an HTTP client for the DKB web interface
 type Client struct {
@@ -36,29 +20,6 @@ type Client struct {
 	mfaId       string
 	accessToken string
 }
-
-// AccountMetadata represents some metadata about a (financial) account as part
-// of a user's DKB account
-type AccountMetadata struct {
-	AccountName     string
-	Account         string
-	Date            string
-	Amount          string
-	AccountType     AccountType
-	TransactionLink string
-}
-
-// AccountType determines the type of an account
-type AccountType int64
-
-const (
-	// CheckingAccount represents a checking account
-	CheckingAccount AccountType = iota
-	// Depot represents a stock share depot
-	Depot
-	// CreditCard represents a credit card
-	CreditCard
-)
 
 // New creates a new Client
 func New() Client {
@@ -99,13 +60,16 @@ func (c *Client) Login(username, password string) error {
 		return err
 	}
 
-	fmt.Println(resp.Status)
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
+	_, err = buf.ReadFrom(resp.Body)
+	if err != nil {
+		return err
+	}
 	mfaMethodResponse := MFAMethodsResponse{}
 
 	json.Unmarshal(buf.Bytes(), &mfaMethodResponse)
-	//fmt.Println(buf.String())
+
+	// TODO: Allow for selection of method to be used
 	recentMethod := getMostRecentlyEnrolledMFAMethod(mfaMethodResponse.Data)
 	fmt.Printf("%+v\n", recentMethod)
 
@@ -283,245 +247,61 @@ func (c *Client) pollVerificationStatus(cid string) error {
 	return nil
 }
 
-// ParseOverview parses the financial overview status page on the DKB website
-// and returns a slice containing data about each parsed account
-func (c *Client) ParseOverview() ([]AccountMetadata, error) {
-	resp, err := c.httpClient.Get("https://www.dkb.de/DkbTransactionBanking/content/banking/financialstatus/FinancialComposite/FinancialStatus.xhtml?$event=init")
+func (c *Client) GetAccounts() (Accounts, error) {
+	req, err := c.newRequest(http.MethodGet, "https://banking.dkb.de/api/accounts/accounts", nil)
 	if err != nil {
-		return nil, err
+		return Accounts{}, err
 	}
 
-	d, err := goquery.NewDocumentFromReader(resp.Body)
-
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return Accounts{}, err
 	}
 
-	rows := d.Find("tr.mainRow")
+	b, _ := io.ReadAll(resp.Body)
 
-	var result []AccountMetadata
-
-	rows.Each(func(i int, row *goquery.Selection) {
-		var (
-			accountName     string
-			account         string
-			date            string
-			amount          string
-			accountType     AccountType
-			transactionLink string
-		)
-		cols := row.Find("td")
-		cols.Each(func(i int, col *goquery.Selection) {
-			switch i {
-			case 0:
-				accountName = strings.TrimSpace(col.Find("div.forceWrap").Text())
-				break
-			case 1:
-				account = strings.TrimSpace(col.Find("div.iban").Text())
-				break
-			case 2:
-				date = strings.TrimSpace(col.Text())
-				break
-			case 3:
-				amount = strings.TrimSpace(col.Text())
-				break
-			case 4:
-				link := col.Find("a.evt-paymentTransaction")
-				if len(link.Nodes) > 0 {
-					if strings.HasPrefix(account, "DE") {
-						accountType = CheckingAccount
-					} else {
-						accountType = CreditCard
-					}
-
-					transactionLink, _ = link.Attr("href")
-				} else {
-					accountType = Depot
-					transactionLink, _ = col.Find("a.evt-depot").Attr("href")
-				}
-				break
-			default:
-			}
-		})
-		result = append(result, AccountMetadata{
-			AccountName:     accountName,
-			Account:         account,
-			Date:            date,
-			Amount:          amount,
-			AccountType:     accountType,
-			TransactionLink: transactionLink,
-		})
-	})
-	return result, nil
-}
-
-// DkbTime represents a time format which is used by the DKB
-type DkbTime time.Time
-
-// MarshalCSV marshals DkbTime object to CSV
-func (date *DkbTime) MarshalCSV() (string, error) {
-	return time.Time(*date).Format("02.01.2006"), nil
-}
-
-// UnmarshalCSV unmarshals DkbTime from CSV
-func (date *DkbTime) UnmarshalCSV(csv string) (err error) {
-	t, err := time.Parse("02.01.2006", csv)
-	*date = DkbTime(t)
-	return err
-}
-
-// DkbAmount represents an amount of money as formatted by the DKB website
-type DkbAmount float64
-
-// MarshalCSV marshals DkbAmount to CSV
-func (amount *DkbAmount) MarshalCSV() (string, error) {
-	return strconv.FormatFloat(float64(*amount), 'f', 2, 64), nil
-}
-
-// UnmarshalCSV unmarshals CSV to DkbAmount
-func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
-	normalizedAmount := amount.normalizeAmount(csv)
-	floatAmount, err := strconv.ParseFloat(normalizedAmount, 64)
+	accounts := Accounts{}
+	err = json.Unmarshal(b, &accounts)
 	if err != nil {
-		return err
+		return Accounts{}, err
+
 	}
-	*amount = DkbAmount(floatAmount)
-	return nil
+
+	err = resp.Body.Close()
+	if err != nil {
+		return Accounts{}, err
+	}
+
+	return accounts, nil
 }
 
-func (amount *DkbAmount) normalizeAmount(a string) string {
-	result := strings.ReplaceAll(a, ".", "")
-	result = strings.ReplaceAll(result, ",", ".")
-	return result
-}
-
-// AccountTransaction represents a transaction in a DKB checking account
-type AccountTransaction struct {
-	Date              DkbTime   `csv:"Buchungstag"`
-	ValueDate         DkbTime   `csv:"Wertstellung"`
-	PostingText       string    `csv:"Buchungstext"`
-	Payee             string    `csv:"Auftraggeber / Begünstigter"`
-	Purpose           string    `csv:"Verwendungszweck"`
-	BankAccountNumber string    `csv:"Kontonummer"`
-	BankCode          string    `csv:"Bankleitzahl"`
-	Amount            DkbAmount `csv:"Betrag (EUR)"`
-	CreditorID        string    `csv:"Gläubiger-ID"`
-	MandateReference  string    `csv:"Mandatsreferenz"`
-	CustomerReference string    `csv:"Kundenreferenz"`
-}
-
-// CreditCardTransaction represents a transaction in a DKB credit card account
-type CreditCardTransaction struct {
-	Marked    string    `csv:"Umsatz abgerechnet und nicht im Saldo enthalten"` // Ignored (for now)
-	ValueDate DkbTime   `csv:"Wertstellung"`
-	Date      DkbTime   `csv:"Belegdatum"`
-	Purpose   string    `csv:"Beschreibung"`
-	Amount    DkbAmount `csv:"Betrag (EUR)"`
-	//OriginalAmount DkbAmount   `csv:"Ursprünglicher Betrag"` // Ignored (for now)
-}
-
-// GetAccountTransactions returns all transactions in the checking account identified
-// by the provided AccountMetadata between the `from` and `to` times
-func (c *Client) GetAccountTransactions(a AccountMetadata, from time.Time, to time.Time) ([]AccountTransaction, error) {
-	result, err := c.getTransactions(a, from, to)
+func (c *Client) GetTransactions(accountID string) (Transactions, error) {
+	tURL := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
+	req, err := c.newRequest(http.MethodGet, tURL, nil)
 	if err != nil {
-		return nil, err
+		return Transactions{}, err
 	}
 
-	return c.parseAccountTransactions(result)
-}
-
-// GetCreditCardTransactions returns all transactions in the credit card account
-// identified by the provided AccountMetadata between the `from` and `to` times
-func (c *Client) GetCreditCardTransactions(a AccountMetadata, from time.Time, to time.Time) ([]CreditCardTransaction, error) {
-	result, err := c.getTransactions(a, from, to)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return Transactions{}, err
 	}
 
-	return c.parseCreditCardTransactions(result)
-}
+	b, _ := io.ReadAll(resp.Body)
 
-func (c *Client) getTransactions(a AccountMetadata, from time.Time, to time.Time) ([]byte, error) {
-	resp, err := c.httpClient.Get("https://www.dkb.de" + a.TransactionLink)
+	transactions := Transactions{}
+	err = json.Unmarshal(b, &transactions)
 	if err != nil {
-		return nil, err
+		return Transactions{}, err
+
 	}
 
-	d, err := goquery.NewDocumentFromReader(resp.Body)
-
+	err = resp.Body.Close()
 	if err != nil {
-		return nil, err
-	}
-	accountNumber, _ := d.Find("select[name='slAllAccounts'] option[selected='selected']").Attr("value")
-
-	postURL := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze"
-	postData := url.Values{}
-	postData.Add("slTransactionStatus", "0")
-	postData.Add("slSearchPeriod", "1")
-	postData.Add("searchPeriodRadio", "1")
-	postData.Add("transactionDate", from.Format("02.01.2006"))
-	postData.Add("toTransactionDate", to.Format("02.01.2006"))
-	postData.Add("$event", "search")
-	postData.Add("slAllAccounts", accountNumber)
-
-	resp, err = c.httpClient.PostForm(postURL, postData)
-
-	if err != nil {
-		return nil, err
+		return Transactions{}, err
 	}
 
-	// TODO: Clean this up
-	url := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport"
-	if a.AccountType == CreditCard {
-		url = "https://www.dkb.de/banking/finanzstatus/kreditkartenumsaetze?$event=csvExport"
-	}
-	resp, err = c.httpClient.Get(url)
-
-	if err != nil {
-		return nil, err
-	}
-
-	result, err := io.ReadAll(resp.Body)
-
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (c *Client) parseAccountTransactions(transactions []byte) ([]AccountTransaction, error) {
-	var result []AccountTransaction
-
-	r := bufio.NewReader(bytes.NewReader(transactions))
-	skipLines(r, 6) // First six lines consist of metadata
-
-	err := gocsv.Unmarshal(r, &result)
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func (c *Client) parseCreditCardTransactions(transactions []byte) ([]CreditCardTransaction, error) {
-	var result []CreditCardTransaction
-
-	r := bufio.NewReader(bytes.NewReader(transactions))
-	skipLines(r, 6) // First six lines consist of metadata
-
-	err := gocsv.Unmarshal(r, &result)
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func skipLines(r *bufio.Reader, n int) {
-	for i := 0; i < n; i++ {
-		r.ReadLine()
-	}
+	return transactions, nil
 }
 
 // TODO: Move models to proper package
@@ -666,4 +446,53 @@ type Product struct {
 	Id          string `json:"id"`
 	Type        string `json:"type"`
 	DisplayName string `json:"displayName"`
+}
+
+type Transactions struct {
+	Data []Transaction `json:"data"`
+}
+
+type Transaction struct {
+	Type       string                `json:"type"`
+	Id         string                `json:"id"`
+	Attributes TransactionAttributes `json:"attributes"`
+}
+
+type TransactionAttributes struct {
+	Status                  string        `json:"status"`
+	BookingDate             string        `json:"bookingDate"`
+	Description             string        `json:"description"`
+	EndToEndId              string        `json:"endToEndId,omitempty"`
+	TransactionType         string        `json:"transactionType"`
+	PurposeCode             string        `json:"purposeCode,omitempty"`
+	BusinessTransactionCode string        `json:"businessTransactionCode"`
+	Amount                  CurrencyValue `json:"amount"`
+	Creditor                struct {
+		Name            string `json:"name,omitempty"`
+		CreditorAccount struct {
+			AccountNr string `json:"accountNr,omitempty"`
+			Blz       string `json:"blz,omitempty"`
+			Iban      string `json:"iban,omitempty"`
+		} `json:"creditorAccount"`
+		Agent struct {
+			Bic string `json:"bic"`
+		} `json:"agent,omitempty"`
+		IntermediaryName string `json:"intermediaryName,omitempty"`
+		Id               string `json:"id,omitempty"`
+	} `json:"creditor"`
+	Debtor struct {
+		Name          string `json:"name,omitempty"`
+		DebtorAccount struct {
+			AccountNr string `json:"accountNr,omitempty"`
+			Blz       string `json:"blz,omitempty"`
+			Iban      string `json:"iban,omitempty"`
+		} `json:"debtorAccount"`
+		Agent struct {
+			Bic string `json:"bic"`
+		} `json:"agent,omitempty"`
+		IntermediaryName string `json:"intermediaryName,omitempty"`
+	} `json:"debtor"`
+	IsRevocable bool   `json:"isRevocable"`
+	ValueDate   string `json:"valueDate,omitempty"`
+	MandateId   string `json:"mandateId,omitempty"`
 }
