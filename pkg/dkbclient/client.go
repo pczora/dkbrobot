@@ -278,30 +278,87 @@ func (c *Client) GetAccounts() (Accounts, error) {
 	return accounts, nil
 }
 
-func (c *Client) GetTransactions(accountID string) (Transactions, error) {
-	tURL := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
-	req, err := c.newRequest(http.MethodGet, tURL, nil)
+func (c *Client) GetCreditCards() (CreditCards, error) {
+	req, err := c.newRequest(http.MethodGet, "https://banking.dkb.de/api/credit-card/cards?filter%5Btype%5D=creditCard&filter%5Bportfolio%5D=dkb&filter%5Btype%5D=debitCard", nil)
 	if err != nil {
-		return Transactions{}, err
+		return CreditCards{}, err
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Transactions{}, err
+		return CreditCards{}, err
 	}
 
 	b, _ := io.ReadAll(resp.Body)
 
-	transactions := Transactions{}
-	err = json.Unmarshal(b, &transactions)
+	debitCards := CreditCards{}
+	err = json.Unmarshal(b, &debitCards)
 	if err != nil {
-		return Transactions{}, err
+		return CreditCards{}, err
 
 	}
 
 	err = resp.Body.Close()
 	if err != nil {
-		return Transactions{}, err
+		return CreditCards{}, err
+	}
+
+	return debitCards, nil
+}
+
+func (c *Client) GetAccountTransactions(accountID string) (AccountTransactions, error) {
+	tURL := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
+	req, err := c.newRequest(http.MethodGet, tURL, nil)
+	if err != nil {
+		return AccountTransactions{}, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return AccountTransactions{}, err
+	}
+
+	b, _ := io.ReadAll(resp.Body)
+
+	transactions := AccountTransactions{}
+	err = json.Unmarshal(b, &transactions)
+	if err != nil {
+		return AccountTransactions{}, err
+
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return AccountTransactions{}, err
+	}
+
+	return transactions, nil
+}
+
+func (c *Client) GetCreditCardTransactions(creditCardID string) (CreditCardTransactions, error) {
+	tURL := "https://banking.dkb.de/api/credit-card/cards/" + creditCardID + "/transactions"
+	req, err := c.newRequest(http.MethodGet, tURL, nil)
+	if err != nil {
+		return CreditCardTransactions{}, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return CreditCardTransactions{}, err
+	}
+
+	b, _ := io.ReadAll(resp.Body)
+
+	transactions := CreditCardTransactions{}
+	err = json.Unmarshal(b, &transactions)
+	if err != nil {
+		return CreditCardTransactions{}, err
+
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return CreditCardTransactions{}, err
 	}
 
 	return transactions, nil
@@ -451,17 +508,17 @@ type Product struct {
 	DisplayName string `json:"displayName"`
 }
 
-type Transactions struct {
-	Data []Transaction `json:"data"`
+type AccountTransactions struct {
+	Data []AccountTransaction `json:"data"`
 }
 
-type Transaction struct {
-	Type       string                `json:"type"`
-	Id         string                `json:"id"`
-	Attributes TransactionAttributes `json:"attributes"`
+type AccountTransaction struct {
+	Type       string                       `json:"type"`
+	Id         string                       `json:"id"`
+	Attributes AccountTransactionAttributes `json:"attributes"`
 }
 
-type TransactionAttributes struct {
+type AccountTransactionAttributes struct {
 	Status                  string        `json:"status"`
 	BookingDate             string        `json:"bookingDate"`
 	Description             string        `json:"description"`
@@ -498,4 +555,132 @@ type TransactionAttributes struct {
 	IsRevocable bool   `json:"isRevocable"`
 	ValueDate   string `json:"valueDate,omitempty"`
 	MandateId   string `json:"mandateId,omitempty"`
+}
+
+type CreditCards struct {
+	Data []CreditCard `json:"data"`
+	Meta struct {
+		Messages []interface{} `json:"messages"`
+	} `json:"meta"`
+}
+
+type CreditCard struct {
+	Type       string `json:"type"`
+	Id         string `json:"id"`
+	Attributes struct {
+		MaskedPan      string `json:"maskedPan"`
+		Network        string `json:"network"`
+		EngravedLine1  string `json:"engravedLine1"`
+		EngravedLine2  string `json:"engravedLine2,omitempty"`
+		ActivationDate string `json:"activationDate,omitempty"`
+		ExpiryDate     string `json:"expiryDate"`
+		Balance        struct {
+			Date         string `json:"date"`
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"balance,omitempty"`
+		State string `json:"state"`
+		Owner struct {
+			FirstName  string `json:"firstName"`
+			LastName   string `json:"lastName"`
+			Title      string `json:"title"`
+			Salutation string `json:"salutation"`
+		} `json:"owner,omitempty"`
+		Holder struct {
+			Person struct {
+				FirstName string `json:"firstName"`
+				LastName  string `json:"lastName"`
+			} `json:"person"`
+		} `json:"holder"`
+		Product struct {
+			SuperProductId string `json:"superProductId"`
+			DisplayName    string `json:"displayName"`
+			Institute      string `json:"institute"`
+			ProductType    string `json:"productType"`
+			OwnerType      string `json:"ownerType"`
+			Id             string `json:"id"`
+			Type           string `json:"type"`
+		} `json:"product"`
+		Limit struct {
+			CurrencyCode string `json:"currencyCode,omitempty"`
+			Value        string `json:"value,omitempty"`
+			Identifier   string `json:"identifier,omitempty"`
+			Categories   []struct {
+				Name   string `json:"name"`
+				Amount struct {
+					CurrencyCode string `json:"currencyCode"`
+					Value        string `json:"value"`
+				} `json:"amount"`
+			} `json:"categories,omitempty"`
+		} `json:"limit"`
+		AvailableLimit struct {
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"availableLimit,omitempty"`
+		AuthorizedAmount struct {
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"authorizedAmount,omitempty"`
+		ReferenceAccount struct {
+			Iban string `json:"iban"`
+			Bic  string `json:"bic"`
+		} `json:"referenceAccount"`
+		Status struct {
+			Category       string        `json:"category"`
+			LimitationsFor []interface{} `json:"limitationsFor,omitempty"`
+		} `json:"status"`
+		BillingDetails struct {
+			Days         []int  `json:"days"`
+			CalendarType string `json:"calendarType"`
+			Cycle        string `json:"cycle"`
+		} `json:"billingDetails,omitempty"`
+		CreationDate      string `json:"creationDate,omitempty"`
+		FailedPinAttempts int    `json:"failedPinAttempts,omitempty"`
+	} `json:"attributes"`
+	Relationships struct {
+		Owner struct {
+			Data struct {
+				Type string `json:"type"`
+				Id   string `json:"id"`
+			} `json:"data"`
+		} `json:"owner,omitempty"`
+		Legitimates struct {
+			Data []struct {
+				Type string `json:"type"`
+				Id   string `json:"id"`
+			} `json:"data"`
+		} `json:"legitimates,omitempty"`
+	} `json:"relationships"`
+}
+
+type CreditCardTransactions struct {
+	Data []CreditCardTransaction `json:"data"`
+}
+
+type CreditCardTransaction struct {
+	Type       string                          `json:"type"`
+	Id         string                          `json:"id"`
+	Attributes CreditCardTransactionAttributes `json:"attributes"`
+}
+
+type CreditCardTransactionAttributes struct {
+	Amount struct {
+		ConversionRate string `json:"conversionRate"`
+		CurrencyCode   string `json:"currencyCode"`
+		Value          string `json:"value"`
+	} `json:"amount"`
+	CardId         string `json:"cardId"`
+	MerchantAmount struct {
+		CurrencyCode string `json:"currencyCode"`
+		Value        string `json:"value"`
+	} `json:"merchantAmount"`
+	MerchantCategory struct {
+		Code string `json:"code"`
+	} `json:"merchantCategory,omitempty"`
+	Status            string        `json:"status"`
+	TransactionType   string        `json:"transactionType"`
+	AuthorizationDate time.Time     `json:"authorizationDate"`
+	BookingDate       string        `json:"bookingDate"`
+	Description       string        `json:"description"`
+	Bonuses           []interface{} `json:"bonuses"`
 }
