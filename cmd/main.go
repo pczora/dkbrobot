@@ -2,12 +2,10 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"syscall"
-	"time"
-
 	"github.com/pczora/dkbrobot/pkg/dkbclient"
 	"golang.org/x/term"
+	"os"
+	"syscall"
 )
 
 func main() {
@@ -36,32 +34,11 @@ func main() {
 		panic(err)
 	}
 
-	accounts, err := c.ParseOverview()
+	accounts, err := c.GetAccounts()
 	if err != nil {
 		panic(err)
 	}
 
-	for _, a := range accounts {
-		if a.AccountType == dkbclient.Depot {
-			continue
-		} else if a.AccountType == dkbclient.CheckingAccount {
-			transactions, err := c.GetAccountTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
-			if err != nil {
-				panic(err)
-			}
-			for _, transaction := range transactions {
-				fmt.Println(transaction)
-			}
-		} else if a.AccountType == dkbclient.CreditCard {
-			transactions, err := c.GetCreditCardTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
-			if err != nil {
-				panic(err)
-			}
-			for _, transaction := range transactions {
-				fmt.Printf("%+v\n", transaction)
-			}
-		}
-
-	}
+	fmt.Printf("%+v", accounts)
 
 }
