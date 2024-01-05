@@ -29,7 +29,7 @@ func main() {
 
 	c := dkbclient.New()
 
-	err = c.Login(username, password)
+	err = c.Login(username, password, dkbclient.GetMostRecentlyEnrolledMFAMethod)
 	if err != nil {
 		panic(err)
 	}

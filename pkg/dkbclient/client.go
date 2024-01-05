@@ -15,10 +15,12 @@ import (
 
 // Client is an HTTP client for the DKB web interface
 type Client struct {
-	httpClient  *http.Client
-	xsrfToken   string
-	mfaId       string
-	accessToken string
+	httpClient                     *http.Client
+	xsrfToken                      string
+	mfaId                          string
+	accessToken                    string
+	VerificationStatusPollInterval time.Duration
+	VerificationStatusPollRetries  int
 }
 
 // New creates a new Client
@@ -33,11 +35,13 @@ func New() Client {
 		return nil
 	}}
 
-	return Client{httpClient: httpClient}
+	return Client{httpClient: httpClient, VerificationStatusPollInterval: 3000 * time.Millisecond, VerificationStatusPollRetries: 60}
 }
 
+type MfaMethodSelector func(methods []MFAMethod) (MFAMethod, error)
+
 // Login logs in to the DKB website using the provided credentials
-func (c *Client) Login(username, password string) error {
+func (c *Client) Login(username, password string, mfaMethodSelector MfaMethodSelector) error {
 
 	xsrfToken, err := c.getXsrfToken()
 
@@ -73,10 +77,13 @@ func (c *Client) Login(username, password string) error {
 	}
 
 	// TODO: Allow for selection of method to be used
-	recentMethod := getMostRecentlyEnrolledMFAMethod(mfaMethodResponse.Data)
-	fmt.Printf("%+v\n", recentMethod)
+	selectedMethod, err := mfaMethodSelector(mfaMethodResponse.Data)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%+v\n", selectedMethod)
 
-	ch := newMFAChallenge(recentMethod.ID, c.mfaId)
+	ch := newMFAChallenge(selectedMethod.ID, c.mfaId)
 	chb, _ := json.Marshal(ch)
 	r, err = c.newRequest(http.MethodPost, "https://banking.dkb.de/api/mfa/mfa/challenges", bytes.NewReader(chb))
 	r.Header.Set("Content-Type", "application/vnd.api+json")
@@ -179,6 +186,7 @@ func (c *Client) postToken() error {
 	return nil
 }
 
+// newRequest wraps http.NewRequest and adds the `x-xsrf-token` header
 func (c *Client) newRequest(method string, url string, body io.Reader) (*http.Request, error) {
 	r, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -222,7 +230,8 @@ func (c *Client) pollVerificationStatus(cid string) error {
 	if err != nil {
 		return err
 	}
-	for i := 0; i < 60; i++ {
+	// TODO: Return error if verification failed after c.VerificationStatusPollRetries retries
+	for i := 0; i < c.VerificationStatusPollRetries; i++ {
 
 		pollID++
 
@@ -230,8 +239,8 @@ func (c *Client) pollVerificationStatus(cid string) error {
 
 		b, _ := io.ReadAll(resp.Body)
 
-		c := MFAChallengeResponse{}
-		err := json.Unmarshal(b, &c)
+		cr := MFAChallengeResponse{}
+		err := json.Unmarshal(b, &cr)
 		if err != nil {
 			return err
 		}
@@ -241,10 +250,10 @@ func (c *Client) pollVerificationStatus(cid string) error {
 			return err
 		}
 
-		if c.Data.Attributes.VerificationStatus == "processed" {
+		if cr.Data.Attributes.VerificationStatus == "processed" {
 			break
 		}
-		time.Sleep(3000 * time.Millisecond)
+		time.Sleep(c.VerificationStatusPollInterval)
 	}
 
 	return nil
@@ -291,8 +300,8 @@ func (c *Client) GetCreditCards() (CreditCards, error) {
 
 	b, _ := io.ReadAll(resp.Body)
 
-	debitCards := CreditCards{}
-	err = json.Unmarshal(b, &debitCards)
+	creditCards := CreditCards{}
+	err = json.Unmarshal(b, &creditCards)
 	if err != nil {
 		return CreditCards{}, err
 
@@ -303,7 +312,7 @@ func (c *Client) GetCreditCards() (CreditCards, error) {
 		return CreditCards{}, err
 	}
 
-	return debitCards, nil
+	return creditCards, nil
 }
 
 func (c *Client) GetAccountTransactions(accountID string) (AccountTransactions, error) {
@@ -388,14 +397,34 @@ type MFAMethod struct {
 	} `json:"attributes"`
 }
 
-func getMostRecentlyEnrolledMFAMethod(methods []MFAMethod) MFAMethod {
-	mostRecentlyenrolledMethod := methods[0]
+func GetMostRecentlyEnrolledMFAMethod(methods []MFAMethod) (MFAMethod, error) {
+	if len(methods) == 0 {
+		return MFAMethod{}, fmt.Errorf("no MFAMethods available")
+	}
+	mre := methods[0]
 	for _, m := range methods {
-		if m.Attributes.EnrolledAt.After(mostRecentlyenrolledMethod.Attributes.EnrolledAt) {
-			mostRecentlyenrolledMethod = m
+		if m.Attributes.EnrolledAt.After(mre.Attributes.EnrolledAt) {
+			mre = m
 		}
 	}
-	return mostRecentlyenrolledMethod
+	return mre, nil
+}
+
+func UserSelectMFAMethod(methods []MFAMethod) (MFAMethod, error) {
+	var selection int
+	for i, m := range methods {
+		fmt.Printf("%d. '%s', enrolled at %s\n", i+1, m.Attributes.DeviceName, m.Attributes.EnrolledAt)
+	}
+	fmt.Print("Selection: ")
+	_, err := fmt.Scanf("%d", &selection)
+	if err != nil {
+		return MFAMethod{}, err
+	}
+
+	if selection < 1 || selection > len(methods)+1 {
+		return MFAMethod{}, fmt.Errorf("invalid selection %d, valid range: 1-%d", selection, len(methods)+1)
+	}
+	return methods[selection-1], nil
 }
 
 type MFAChallenge struct {
