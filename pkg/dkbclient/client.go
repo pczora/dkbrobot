@@ -373,7 +373,86 @@ func (c *Client) GetCreditCardTransactions(creditCardID string) (CreditCardTrans
 	return transactions, nil
 }
 
+func (c *Client) GetDocuments() (Documents, error) {
+	dURL := "https://banking.dkb.de/api/documentstorage/documents?page%5Blimit%5D=1000"
+	req, err := c.newRequest(http.MethodGet, dURL, nil)
+	if err != nil {
+		return Documents{}, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return Documents{}, err
+	}
+
+	b, _ := io.ReadAll(resp.Body)
+
+	var d Documents
+
+	err = json.Unmarshal(b, &d)
+	if err != nil {
+		return Documents{}, err
+	}
+	return d, nil
+}
+
+func (c *Client) GetDocumentData(id string) ([]byte, error) {
+	dURL := "https://banking.dkb.de/api/documentstorage/documents/" + id
+	req, err := c.newRequest(http.MethodGet, dURL, nil)
+	req.Header.Set("Accept", "application/pdf")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+
+}
+
 // TODO: Move models to proper package
+
+type Documents struct {
+	Data []Document `json:"data"`
+}
+
+type Document struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Links struct {
+		Self string `json:"self"`
+	} `json:"links"`
+	Attributes struct {
+		CreationDate    time.Time `json:"creationDate"`
+		ExpirationDate  string    `json:"expirationDate"`
+		RetentionPeriod string    `json:"retentionPeriod"`
+		ContentType     string    `json:"contentType"`
+		Checksum        string    `json:"checksum"`
+		FileName        string    `json:"fileName"`
+		Metadata        struct {
+			CardID            string `json:"cardId"`
+			StatementDate     string `json:"statementDate"`
+			StatementAmount   string `json:"statementAmount"`
+			Subject           string `json:"subject"`
+			StatementID       string `json:"statementID"`
+			StatementCurrency string `json:"statementCurrency"`
+		} `json:"metadata"`
+		Owner string `json:"owner"`
+	} `json:"attributes"`
+	Relationships struct {
+		DocumentType struct {
+			Links struct {
+				Self    string `json:"self"`
+				Related string `json:"related"`
+			} `json:"links"`
+		} `json:"documentType"`
+	} `json:"relationships"`
+}
 
 type MFAMethodsResponse struct {
 	Data []MFAMethod `json:"data"`

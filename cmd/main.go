@@ -5,6 +5,7 @@ import (
 	"github.com/pczora/dkbrobot/pkg/dkbclient"
 	"golang.org/x/term"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -34,11 +35,38 @@ func main() {
 		panic(err)
 	}
 
-	accounts, err := c.GetAccounts()
+	//accounts, err := c.GetAccounts()
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//fmt.Printf("%+v", accounts)
+
+	documents, err := c.GetDocuments()
+
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("%+v", accounts)
+	for _, d := range documents.Data {
+		fmt.Printf("%+v\n", d)
+		data, err := c.GetDocumentData(d.ID)
+		if err != nil {
+			panic(err)
+		}
+
+		filename := d.Attributes.FileName
+		if !strings.HasSuffix(filename, ".pdf") {
+			filename = filename + ".pdf"
+		}
+
+		f, err := os.Create(filename)
+		if err != nil {
+			panic(err)
+		}
+		f.Write(data)
+		f.Close()
+
+	}
 
 }
