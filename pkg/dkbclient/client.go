@@ -259,140 +259,96 @@ func (c *Client) pollVerificationStatus(cid string) error {
 	return nil
 }
 
-func (c *Client) GetAccounts() (Accounts, error) {
-	req, err := c.newRequest(http.MethodGet, "https://banking.dkb.de/api/accounts/accounts", nil)
+// get uses the client c to perform a GET request to the provided URL; parsing it into a K
+// Since go does not support type parameters in methods, this is implemented as a function, instead of a method of Client
+func get[K any](c *Client, url string, dst *K) error {
+	req, err := c.newRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return Accounts{}, err
+		return err
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Accounts{}, err
+		return err
 	}
 
 	b, _ := io.ReadAll(resp.Body)
 
-	accounts := Accounts{}
-	err = json.Unmarshal(b, &accounts)
+	err = json.Unmarshal(b, &dst)
 	if err != nil {
-		return Accounts{}, err
-
+		return err
 	}
 
 	err = resp.Body.Close()
 	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) GetAccounts() (Accounts, error) {
+	u := "https://banking.dkb.de/api/accounts/accounts"
+
+	var a Accounts
+
+	err := get(c, u, &a)
+	if err != nil {
 		return Accounts{}, err
 	}
 
-	return accounts, nil
+	return a, nil
 }
 
 func (c *Client) GetCreditCards() (CreditCards, error) {
-	req, err := c.newRequest(http.MethodGet, "https://banking.dkb.de/api/credit-card/cards?filter%5Btype%5D=creditCard&filter%5Bportfolio%5D=dkb&filter%5Btype%5D=debitCard", nil)
+	u := "https://banking.dkb.de/api/credit-card/cards?filter%5Btype%5D=creditCard&filter%5Bportfolio%5D=dkb&filter%5Btype%5D=debitCard"
+
+	var cc CreditCards
+
+	err := get(c, u, &cc)
 	if err != nil {
 		return CreditCards{}, err
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return CreditCards{}, err
-	}
-
-	b, _ := io.ReadAll(resp.Body)
-
-	creditCards := CreditCards{}
-	err = json.Unmarshal(b, &creditCards)
-	if err != nil {
-		return CreditCards{}, err
-
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		return CreditCards{}, err
-	}
-
-	return creditCards, nil
+	return cc, nil
 }
 
 func (c *Client) GetAccountTransactions(accountID string) (AccountTransactions, error) {
-	tURL := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
-	req, err := c.newRequest(http.MethodGet, tURL, nil)
+	u := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
+
+	var at AccountTransactions
+
+	err := get(c, u, &at)
 	if err != nil {
 		return AccountTransactions{}, err
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return AccountTransactions{}, err
-	}
-
-	b, _ := io.ReadAll(resp.Body)
-
-	transactions := AccountTransactions{}
-	err = json.Unmarshal(b, &transactions)
-	if err != nil {
-		return AccountTransactions{}, err
-
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		return AccountTransactions{}, err
-	}
-
-	return transactions, nil
+	return at, nil
 }
 
 func (c *Client) GetCreditCardTransactions(creditCardID string) (CreditCardTransactions, error) {
-	tURL := "https://banking.dkb.de/api/credit-card/cards/" + creditCardID + "/transactions"
-	req, err := c.newRequest(http.MethodGet, tURL, nil)
+	u := "https://banking.dkb.de/api/credit-card/cards/" + creditCardID + "/transactions"
+
+	var cct CreditCardTransactions
+
+	err := get(c, u, &cct)
 	if err != nil {
 		return CreditCardTransactions{}, err
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return CreditCardTransactions{}, err
-	}
-
-	b, _ := io.ReadAll(resp.Body)
-
-	transactions := CreditCardTransactions{}
-	err = json.Unmarshal(b, &transactions)
-	if err != nil {
-		return CreditCardTransactions{}, err
-
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		return CreditCardTransactions{}, err
-	}
-
-	return transactions, nil
+	return cct, nil
 }
 
 func (c *Client) GetDocuments() (Documents, error) {
-	dURL := "https://banking.dkb.de/api/documentstorage/documents?page%5Blimit%5D=1000"
-	req, err := c.newRequest(http.MethodGet, dURL, nil)
-	if err != nil {
-		return Documents{}, err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return Documents{}, err
-	}
-
-	b, _ := io.ReadAll(resp.Body)
+	u := "https://banking.dkb.de/api/documentstorage/documents?page%5Blimit%5D=1000"
 
 	var d Documents
 
-	err = json.Unmarshal(b, &d)
+	err := get(c, u, &d)
 	if err != nil {
 		return Documents{}, err
 	}
+
 	return d, nil
 }
 
