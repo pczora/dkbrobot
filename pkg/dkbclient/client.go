@@ -1,60 +1,27 @@
 package dkbclient
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
-	"github.com/gocarina/gocsv"
-	"golang.org/x/text/encoding/charmap"
 )
-
-func init() {
-	gocsv.SetCSVReader(func(in io.Reader) gocsv.CSVReader {
-		// DKB uses ISO8859-15 (for whatever reason)
-		reader := csv.NewReader(charmap.ISO8859_15.NewDecoder().Reader(in))
-		reader.Comma = ';'
-		return reader
-	})
-}
 
 // Client is an HTTP client for the DKB web interface
 type Client struct {
-	httpClient *http.Client
+	httpClient                     *http.Client
+	xsrfToken                      string
+	mfaId                          string
+	accessToken                    string
+	VerificationStatusPollInterval time.Duration
+	VerificationStatusPollRetries  int
 }
-
-// AccountMetadata represents some metadata about a (financial) account as part
-// of a user's DKB account
-type AccountMetadata struct {
-	AccountName     string
-	Account         string
-	Date            string
-	Amount          string
-	AccountType     AccountType
-	TransactionLink string
-}
-
-// AccountType determines the type of an account
-type AccountType int64
-
-const (
-	// CheckingAccount represents a checking account
-	CheckingAccount AccountType = iota
-	// Depot represents a stock share depot
-	Depot
-	// CreditCard represents a credit card
-	CreditCard
-)
 
 // New creates a new Client
 func New() Client {
@@ -68,74 +35,214 @@ func New() Client {
 		return nil
 	}}
 
-	return Client{httpClient: httpClient}
+	return Client{httpClient: httpClient, VerificationStatusPollInterval: 3000 * time.Millisecond, VerificationStatusPollRetries: 60}
 }
 
+type MfaMethodSelector func(methods []MFAMethod) (MFAMethod, error)
+
 // Login logs in to the DKB website using the provided credentials
-func (c *Client) Login(username, password string) error {
+func (c *Client) Login(username, password string, mfaMethodSelector MfaMethodSelector) error {
 
-	resp, err := c.httpClient.Get("https://www.ib.dkb.de/banking")
+	xsrfToken, err := c.getXsrfToken()
+
 	if err != nil {
-		panic(err)
+		return err
 	}
-	d, err := goquery.NewDocumentFromReader(resp.Body)
+	c.xsrfToken = xsrfToken
+
+	err = c.postLoginCredentials(username, password)
 	if err != nil {
-		return fmt.Errorf("could not create document from reponse: %v", err)
+		return err
 	}
 
-	sid, _ := d.Find("form#login input[name='$sID$']").Attr("value")
-	token, _ := d.Find("form#login input[name='token']").Attr("value")
+	r, err := c.newRequest(http.MethodGet, "https://banking.dkb.de/api/mfa/mfa/methods?filter%5BmethodType%5D=seal_one", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(r)
+	if err != nil {
+		return err
+	}
 
+	buf := new(bytes.Buffer)
+	_, err = buf.ReadFrom(resp.Body)
+	if err != nil {
+		return err
+	}
+	mfaMethodResponse := MFAMethodsResponse{}
+
+	err = json.Unmarshal(buf.Bytes(), &mfaMethodResponse)
+	if err != nil {
+		return err
+	}
+
+	// TODO: Allow for selection of method to be used
+	selectedMethod, err := mfaMethodSelector(mfaMethodResponse.Data)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%+v\n", selectedMethod)
+
+	ch := newMFAChallenge(selectedMethod.ID, c.mfaId)
+	chb, _ := json.Marshal(ch)
+	r, err = c.newRequest(http.MethodPost, "https://banking.dkb.de/api/mfa/mfa/challenges", bytes.NewReader(chb))
+	r.Header.Set("Content-Type", "application/vnd.api+json")
+	resp, err = c.httpClient.Do(r)
+	if err != nil {
+		return err
+	}
+
+	b, _ := io.ReadAll(resp.Body)
+
+	cr := MFAChallengeResponse{}
+	err = json.Unmarshal(b, &cr)
+	if err != nil {
+		return err
+	}
+
+	err = c.pollVerificationStatus(cr.Data.ID)
+	if err != nil {
+		return err
+	}
+
+	err = c.postToken()
+	if err != nil {
+		return err
+	}
+
+	r, err = c.newRequest(http.MethodGet, "https://banking.dkb.de/api/accounts/accounts", nil)
+	r.Header.Set("Content-Type", "application/vnd.api+json")
+	resp, err = c.httpClient.Do(r)
+	if err != nil {
+		return err
+	}
+	b, _ = io.ReadAll(resp.Body)
+	fmt.Printf("%+v", string(b))
+	return nil
+}
+
+// TODO: Naming (or refactoring)
+// currently this does more than just posting credentials: it also sets `c.mfa_id` and `c.accessToken`
+func (c *Client) postLoginCredentials(username string, password string) error {
 	data := url.Values{}
 
-	data.Add("$sID$", sid)
-	data.Add("token", token)
-	data.Add("j_username", username)
-	data.Add("j_password", password)
+	data.Add("grant_type", "banking_user_sca")
+	data.Add("sca_type", "web-login")
+	data.Add("username", username)
+	data.Add("password", password)
 
-	resp, err = c.httpClient.PostForm("https://www.ib.dkb.de/banking", data)
+	r, err := c.newRequest(http.MethodPost, "https://banking.dkb.de/api/token", strings.NewReader(data.Encode()))
 	if err != nil {
 		return err
 	}
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	resp, err := c.httpClient.Do(r)
 	if err != nil {
 		return err
 	}
 
-	xsrfToken, _ := doc.Find("input[name='XSRFPreventionToken']").Attr("value")
-	action, _ := doc.Find("form#confirmForm").Attr("action")
-	err = c.pollVerification(action, xsrfToken)
+	fmt.Println(resp.Status)
+
+	buf := new(bytes.Buffer)
+
+	_, err = buf.ReadFrom(resp.Body)
 	if err != nil {
 		return err
+	}
+
+	tokenData := TokenData{}
+
+	err = json.Unmarshal(buf.Bytes(), &tokenData)
+	if err != nil {
+		return err
+	}
+
+	c.mfaId = tokenData.MfaID
+	c.accessToken = tokenData.AccessToken
+
+	return nil
+}
+
+func (c *Client) postToken() error {
+	data := url.Values{}
+
+	data.Add("grant_type", "banking_user_mfa")
+	data.Add("mfa_id", c.mfaId)
+	data.Add("access_token", c.accessToken)
+
+	r, err := c.newRequest(http.MethodPost, "https://banking.dkb.de/api/token", strings.NewReader(data.Encode()))
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(r)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POSTing token failed: %v", err)
 	}
 	return nil
 }
 
-func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) error {
+// newRequest wraps http.NewRequest and adds the `x-xsrf-token` header
+func (c *Client) newRequest(method string, url string, body io.Reader) (*http.Request, error) {
+	r, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	r.Header.Set("x-xsrf-token", c.xsrfToken)
+	return r, nil
+}
 
+func (c *Client) getXsrfToken() (string, error) {
+	_, err := c.httpClient.Get("https://banking.dkb.de/login")
+	if err != nil {
+		return "", err
+	}
+
+	u, err := url.Parse("https://banking.dkb.de")
+	if err != nil {
+		return "", err
+	}
+
+	t := ""
+	found := false
+
+	for _, cookie := range c.httpClient.Jar.Cookies(u) {
+		if cookie.Name == "__Host-xsrf" {
+			t = cookie.Value
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", errors.New("XSRF cookie not found")
+	}
+	return t, nil
+}
+func (c *Client) pollVerificationStatus(cid string) error {
 	pollID := time.Now().UTC().UnixMilli() * 1000
-	pollURL := "https://www.ib.dkb.de" + confirmFormAction
+	pollURL := "https://banking.dkb.de/api/mfa/mfa/challenges/" + cid
 
-	for i := 0; i < 60; i++ {
+	req, err := http.NewRequest(http.MethodGet, pollURL, nil)
+	if err != nil {
+		return err
+	}
+	// TODO: Return error if verification failed after c.VerificationStatusPollRetries retries
+	for i := 0; i < c.VerificationStatusPollRetries; i++ {
 
 		pollID++
 
-		fullPollURL := pollURL + "?$event=pollingVerification&$ignore.request=true&_=" + strconv.Itoa(int(pollID))
-
-		resp, _ := c.httpClient.Get(fullPollURL)
+		resp, _ := c.httpClient.Do(req)
 
 		b, _ := io.ReadAll(resp.Body)
 
-		bodyJSON := make(map[string]string)
-		err := json.Unmarshal(b, &bodyJSON)
+		cr := MFAChallengeResponse{}
+		err := json.Unmarshal(b, &cr)
 		if err != nil {
 			return err
-		}
-
-		if bodyJSON["state"] == "PROCESSED" {
-			fmt.Println("success")
-			break
 		}
 
 		err = resp.Body.Close()
@@ -143,260 +250,501 @@ func (c *Client) pollVerification(confirmFormAction string, xsrfToken string) er
 			return err
 		}
 
-		time.Sleep(3000 * time.Millisecond)
+		if cr.Data.Attributes.VerificationStatus == "processed" {
+			break
+		}
+		time.Sleep(c.VerificationStatusPollInterval)
 	}
-
-	postData := url.Values{}
-	postData.Add("$event", "next")
-	postData.Add("XSRFPreventionToken", xsrfToken)
-
-	resp, err := c.httpClient.PostForm(pollURL, postData)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(resp.Status)
 
 	return nil
 }
 
-// ParseOverview parses the financial over view status page on the DKB website
-// and returns a slice containing data about each parsed account
-func (c *Client) ParseOverview() ([]AccountMetadata, error) {
-	resp, err := c.httpClient.Get("https://www.dkb.de/DkbTransactionBanking/content/banking/financialstatus/FinancialComposite/FinancialStatus.xhtml?$event=init")
-	if err != nil {
-		return nil, err
-	}
-
-	d, err := goquery.NewDocumentFromReader(resp.Body)
-
-	if err != nil {
-		return nil, err
-	}
-
-	rows := d.Find("tr.mainRow")
-
-	var result []AccountMetadata
-
-	rows.Each(func(i int, row *goquery.Selection) {
-		var (
-			accountName     string
-			account         string
-			date            string
-			amount          string
-			accountType     AccountType
-			transactionLink string
-		)
-		cols := row.Find("td")
-		cols.Each(func(i int, col *goquery.Selection) {
-			switch i {
-			case 0:
-				accountName = strings.TrimSpace(col.Find("div.forceWrap").Text())
-				break
-			case 1:
-				account = strings.TrimSpace(col.Find("div.iban").Text())
-				break
-			case 2:
-				date = strings.TrimSpace(col.Text())
-				break
-			case 3:
-				amount = strings.TrimSpace(col.Text())
-				break
-			case 4:
-				link := col.Find("a.evt-paymentTransaction")
-				if len(link.Nodes) > 0 {
-					if strings.HasPrefix(account, "DE") {
-						accountType = CheckingAccount
-					} else {
-						accountType = CreditCard
-					}
-
-					transactionLink, _ = link.Attr("href")
-				} else {
-					accountType = Depot
-					transactionLink, _ = col.Find("a.evt-depot").Attr("href")
-				}
-				break
-			default:
-			}
-		})
-		result = append(result, AccountMetadata{
-			AccountName:     accountName,
-			Account:         account,
-			Date:            date,
-			Amount:          amount,
-			AccountType:     accountType,
-			TransactionLink: transactionLink,
-		})
-	})
-	return result, nil
-}
-
-// DkbTime represents a time format which is used by the DKB
-type DkbTime time.Time
-
-// MarshalCSV marshals DkbTime object to CSV
-func (date *DkbTime) MarshalCSV() (string, error) {
-	return time.Time(*date).Format("02.01.2006"), nil
-}
-
-// UnmarshalCSV unmarshals DkbTime from CSV
-func (date *DkbTime) UnmarshalCSV(csv string) (err error) {
-	t, err := time.Parse("02.01.2006", csv)
-	*date = DkbTime(t)
-	return err
-}
-
-// DkbAmount represents an amount of money as formatted by the DKB website
-type DkbAmount float64
-
-// MarshalCSV marshals DkbAmount to CSV
-func (amount *DkbAmount) MarshalCSV() (string, error) {
-	return strconv.FormatFloat(float64(*amount), 'f', 2, 64), nil
-}
-
-// UnmarshalCSV unmarshals CSV to DkbAmount
-func (amount *DkbAmount) UnmarshalCSV(csv string) (err error) {
-	normalizedAmount := amount.normalizeAmount(csv)
-	floatAmount, err := strconv.ParseFloat(normalizedAmount, 64)
+// get uses the client c to perform a GET request to the provided URL; parsing it into a K
+// Since go does not support type parameters in methods, this is implemented as a function, instead of a method of Client
+func get[K any](c *Client, url string, dst *K) error {
+	req, err := c.newRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	*amount = DkbAmount(floatAmount)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	b, _ := io.ReadAll(resp.Body)
+
+	err = json.Unmarshal(b, &dst)
+	if err != nil {
+		return err
+	}
+
+	err = resp.Body.Close()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (amount *DkbAmount) normalizeAmount(a string) string {
-	result := strings.ReplaceAll(a, ".", "")
-	result = strings.ReplaceAll(result, ",", ".")
-	return result
+func (c *Client) GetAccounts() (Accounts, error) {
+	u := "https://banking.dkb.de/api/accounts/accounts"
+
+	var a Accounts
+
+	err := get(c, u, &a)
+	if err != nil {
+		return Accounts{}, err
+	}
+
+	return a, nil
 }
 
-// AccountTransaction represents a transaction in a DKB checking account
+func (c *Client) GetCreditCards() (CreditCards, error) {
+	u := "https://banking.dkb.de/api/credit-card/cards?filter%5Btype%5D=creditCard&filter%5Bportfolio%5D=dkb&filter%5Btype%5D=debitCard"
+
+	var cc CreditCards
+
+	err := get(c, u, &cc)
+	if err != nil {
+		return CreditCards{}, err
+	}
+
+	return cc, nil
+}
+
+func (c *Client) GetAccountTransactions(accountID string) (AccountTransactions, error) {
+	u := "https://banking.dkb.de/api/accounts/accounts/" + accountID + "/transactions"
+
+	var at AccountTransactions
+
+	err := get(c, u, &at)
+	if err != nil {
+		return AccountTransactions{}, err
+	}
+
+	return at, nil
+}
+
+func (c *Client) GetCreditCardTransactions(creditCardID string) (CreditCardTransactions, error) {
+	u := "https://banking.dkb.de/api/credit-card/cards/" + creditCardID + "/transactions"
+
+	var cct CreditCardTransactions
+
+	err := get(c, u, &cct)
+	if err != nil {
+		return CreditCardTransactions{}, err
+	}
+
+	return cct, nil
+}
+
+func (c *Client) GetDocuments() (Documents, error) {
+	u := "https://banking.dkb.de/api/documentstorage/documents?page%5Blimit%5D=1000"
+
+	var d Documents
+
+	err := get(c, u, &d)
+	if err != nil {
+		return Documents{}, err
+	}
+
+	return d, nil
+}
+
+func (c *Client) GetDocumentData(id string) ([]byte, error) {
+	dURL := "https://banking.dkb.de/api/documentstorage/documents/" + id
+	req, err := c.newRequest(http.MethodGet, dURL, nil)
+	req.Header.Set("Accept", "application/pdf")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
+
+}
+
+// TODO: Move models to proper package
+
+type Documents struct {
+	Data []Document `json:"data"`
+}
+
+type Document struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"`
+	Links struct {
+		Self string `json:"self"`
+	} `json:"links"`
+	Attributes struct {
+		CreationDate    time.Time `json:"creationDate"`
+		ExpirationDate  string    `json:"expirationDate"`
+		RetentionPeriod string    `json:"retentionPeriod"`
+		ContentType     string    `json:"contentType"`
+		Checksum        string    `json:"checksum"`
+		FileName        string    `json:"fileName"`
+		Metadata        struct {
+			CardID            string `json:"cardId"`
+			StatementDate     string `json:"statementDate"`
+			StatementAmount   string `json:"statementAmount"`
+			Subject           string `json:"subject"`
+			StatementID       string `json:"statementID"`
+			StatementCurrency string `json:"statementCurrency"`
+		} `json:"metadata"`
+		Owner string `json:"owner"`
+	} `json:"attributes"`
+	Relationships struct {
+		DocumentType struct {
+			Links struct {
+				Self    string `json:"self"`
+				Related string `json:"related"`
+			} `json:"links"`
+		} `json:"documentType"`
+	} `json:"relationships"`
+}
+
+type MFAMethodsResponse struct {
+	Data []MFAMethod `json:"data"`
+}
+
+type MFAMethod struct {
+	Type       string `json:"type"`
+	ID         string `json:"id"`
+	Attributes struct {
+		MethodType                      string    `json:"methodType"`
+		DeviceName                      string    `json:"deviceName"`
+		Locked                          bool      `json:"locked"`
+		RemainingValidationAttempts     int       `json:"remainingValidationAttempts"`
+		RemainingChallenges             int       `json:"remainingChallenges"`
+		MethodTypeOrder3Ds              int       `json:"methodTypeOrder3ds"`
+		SealOneID                       string    `json:"sealOneId"`
+		EnrolledAt                      time.Time `json:"enrolledAt"`
+		Portfolio                       string    `json:"portfolio"`
+		PreferredDevice                 bool      `json:"preferredDevice"`
+		LockingPeriodAfterEnrollmentEnd time.Time `json:"lockingPeriodAfterEnrollmentEnd"`
+	} `json:"attributes"`
+}
+
+func GetMostRecentlyEnrolledMFAMethod(methods []MFAMethod) (MFAMethod, error) {
+	if len(methods) == 0 {
+		return MFAMethod{}, fmt.Errorf("no MFAMethods available")
+	}
+	mre := methods[0]
+	for _, m := range methods {
+		if m.Attributes.EnrolledAt.After(mre.Attributes.EnrolledAt) {
+			mre = m
+		}
+	}
+	return mre, nil
+}
+
+func UserSelectMFAMethod(methods []MFAMethod) (MFAMethod, error) {
+	var selection int
+	for i, m := range methods {
+		fmt.Printf("%d. '%s', enrolled at %s\n", i+1, m.Attributes.DeviceName, m.Attributes.EnrolledAt)
+	}
+	fmt.Print("Selection: ")
+	_, err := fmt.Scanf("%d", &selection)
+	if err != nil {
+		return MFAMethod{}, err
+	}
+
+	if selection < 1 || selection > len(methods)+1 {
+		return MFAMethod{}, fmt.Errorf("invalid selection %d, valid range: 1-%d", selection, len(methods)+1)
+	}
+	return methods[selection-1], nil
+}
+
+type MFAChallenge struct {
+	Data MFAChallengeData `json:"data"`
+}
+
+type MFAChallengeData struct {
+	Attributes MFAChallengeDataAttributes `json:"attributes"`
+	Type       string                     `json:"type"`
+}
+
+type MFAChallengeDataAttributes struct {
+	MethodID   string `json:"methodId"`
+	MethodType string `json:"methodType"`
+	MfaID      string `json:"mfaId"`
+}
+
+func newMFAChallenge(methodId string, mfaID string) MFAChallenge {
+	return MFAChallenge{Data: MFAChallengeData{Type: "mfa-challenge",
+		Attributes: MFAChallengeDataAttributes{
+			MethodID:   methodId,
+			MethodType: "seal_one",
+			MfaID:      mfaID,
+		}}}
+}
+
+type MFAChallengeResponse struct {
+	Data     MFAChallengeResponseData `json:"data"`
+	Included []MFAMethod              `json:"included"`
+}
+
+type MFAChallengeResponseData struct {
+	Type       string `json:"type"`
+	ID         string `json:"id"`
+	Attributes struct {
+		MfaID              string `json:"mfaId"`
+		MethodID           string `json:"methodId"`
+		MethodType         string `json:"methodType"`
+		VerificationStatus string `json:"verificationStatus"`
+	} `json:"attributes"`
+	Relationships struct {
+		Method struct {
+			Data struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+			} `json:"data"`
+		} `json:"method"`
+	} `json:"relationships"`
+	Links struct {
+		Self string `json:"self"`
+	} `json:"links"`
+}
+
+type TokenData struct {
+	AccessToken           string `json:"access_token"`
+	RefreshTokenExpiresIn string `json:"refresh_token_expires_in"`
+	RefreshToken          string `json:"refresh_token"`
+	TokenFactorType       string `json:"token_factor_type"`
+	AnonymousUserID       string `json:"anonymous_user_id"`
+	Scope                 string `json:"scope"`
+	IDToken               string `json:"id_token"`
+	MfaID                 string `json:"mfa_id"`
+	TokenType             string `json:"token_type"`
+	ExpiresIn             int    `json:"expires_in"`
+}
+
+type Accounts struct {
+	Data []Account `json:"data"`
+}
+
+type Account struct {
+	Type       string            `json:"type"`
+	Id         string            `json:"id"`
+	Attributes AccountAttributes `json:"attributes"`
+}
+
+type AccountAttributes struct {
+	HolderName                        string           `json:"holderName"`
+	Iban                              string           `json:"iban"`
+	Permissions                       []string         `json:"permissions"`
+	CurrencyCode                      string           `json:"currencyCode"`
+	Balance                           CurrencyValue    `json:"balance"`
+	AvailableBalance                  CurrencyValue    `json:"availableBalance"`
+	NearTimeBalance                   CurrencyValue    `json:"nearTimeBalance"`
+	Product                           Product          `json:"product"`
+	State                             string           `json:"state"`
+	UpdatedAt                         string           `json:"updatedAt"`
+	OpeningDate                       string           `json:"openingDate"`
+	OverdraftLimit                    string           `json:"overdraftLimit"`
+	OverdraftInterestRate             string           `json:"overdraftInterestRate,omitempty"`
+	InterestRate                      string           `json:"interestRate"`
+	UnauthorizedOverdraftInterestRate string           `json:"unauthorizedOverdraftInterestRate"`
+	LastAccountStatementDate          string           `json:"lastAccountStatementDate"`
+	ReferenceAccount                  ReferenceAccount `json:"referenceAccount,omitempty"`
+}
+
+type CurrencyValue struct {
+	CurrencyCode string `json:"currencyCode"`
+	Value        string `json:"value"`
+}
+
+type ReferenceAccount struct {
+	Iban          string `json:"iban"`
+	AccountNumber string `json:"accountNumber"`
+	Blz           string `json:"blz"`
+}
+type Product struct {
+	Id          string `json:"id"`
+	Type        string `json:"type"`
+	DisplayName string `json:"displayName"`
+}
+
+type AccountTransactions struct {
+	Data []AccountTransaction `json:"data"`
+}
+
 type AccountTransaction struct {
-	Date              DkbTime   `csv:"Buchungstag"`
-	ValueDate         DkbTime   `csv:"Wertstellung"`
-	PostingText       string    `csv:"Buchungstext"`
-	Payee             string    `csv:"Auftraggeber / Begünstigter"`
-	Purpose           string    `csv:"Verwendungszweck"`
-	BankAccountNumber string    `csv:"Kontonummer"`
-	BankCode          string    `csv:"Bankleitzahl"`
-	Amount            DkbAmount `csv:"Betrag (EUR)"`
-	CreditorID        string    `csv:"Gläubiger-ID"`
-	MandateReference  string    `csv:"Mandatsreferenz"`
-	CustomerReference string    `csv:"Kundenreferenz"`
+	Type       string                       `json:"type"`
+	Id         string                       `json:"id"`
+	Attributes AccountTransactionAttributes `json:"attributes"`
 }
 
-// CreditCardTransaction represents a transaction in a DKB credit card account
+type AccountTransactionAttributes struct {
+	Status                  string        `json:"status"`
+	BookingDate             string        `json:"bookingDate"`
+	Description             string        `json:"description"`
+	EndToEndId              string        `json:"endToEndId,omitempty"`
+	TransactionType         string        `json:"transactionType"`
+	PurposeCode             string        `json:"purposeCode,omitempty"`
+	BusinessTransactionCode string        `json:"businessTransactionCode"`
+	Amount                  CurrencyValue `json:"amount"`
+	Creditor                struct {
+		Name            string `json:"name,omitempty"`
+		CreditorAccount struct {
+			AccountNr string `json:"accountNr,omitempty"`
+			Blz       string `json:"blz,omitempty"`
+			Iban      string `json:"iban,omitempty"`
+		} `json:"creditorAccount"`
+		Agent struct {
+			Bic string `json:"bic"`
+		} `json:"agent,omitempty"`
+		IntermediaryName string `json:"intermediaryName,omitempty"`
+		Id               string `json:"id,omitempty"`
+	} `json:"creditor"`
+	Debtor struct {
+		Name          string `json:"name,omitempty"`
+		DebtorAccount struct {
+			AccountNr string `json:"accountNr,omitempty"`
+			Blz       string `json:"blz,omitempty"`
+			Iban      string `json:"iban,omitempty"`
+		} `json:"debtorAccount"`
+		Agent struct {
+			Bic string `json:"bic"`
+		} `json:"agent,omitempty"`
+		IntermediaryName string `json:"intermediaryName,omitempty"`
+	} `json:"debtor"`
+	IsRevocable bool   `json:"isRevocable"`
+	ValueDate   string `json:"valueDate,omitempty"`
+	MandateId   string `json:"mandateId,omitempty"`
+}
+
+type CreditCards struct {
+	Data []CreditCard `json:"data"`
+	Meta struct {
+		Messages []interface{} `json:"messages"`
+	} `json:"meta"`
+}
+
+type CreditCard struct {
+	Type       string `json:"type"`
+	Id         string `json:"id"`
+	Attributes struct {
+		MaskedPan      string `json:"maskedPan"`
+		Network        string `json:"network"`
+		EngravedLine1  string `json:"engravedLine1"`
+		EngravedLine2  string `json:"engravedLine2,omitempty"`
+		ActivationDate string `json:"activationDate,omitempty"`
+		ExpiryDate     string `json:"expiryDate"`
+		Balance        struct {
+			Date         string `json:"date"`
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"balance,omitempty"`
+		State string `json:"state"`
+		Owner struct {
+			FirstName  string `json:"firstName"`
+			LastName   string `json:"lastName"`
+			Title      string `json:"title"`
+			Salutation string `json:"salutation"`
+		} `json:"owner,omitempty"`
+		Holder struct {
+			Person struct {
+				FirstName string `json:"firstName"`
+				LastName  string `json:"lastName"`
+			} `json:"person"`
+		} `json:"holder"`
+		Product struct {
+			SuperProductId string `json:"superProductId"`
+			DisplayName    string `json:"displayName"`
+			Institute      string `json:"institute"`
+			ProductType    string `json:"productType"`
+			OwnerType      string `json:"ownerType"`
+			Id             string `json:"id"`
+			Type           string `json:"type"`
+		} `json:"product"`
+		Limit struct {
+			CurrencyCode string `json:"currencyCode,omitempty"`
+			Value        string `json:"value,omitempty"`
+			Identifier   string `json:"identifier,omitempty"`
+			Categories   []struct {
+				Name   string `json:"name"`
+				Amount struct {
+					CurrencyCode string `json:"currencyCode"`
+					Value        string `json:"value"`
+				} `json:"amount"`
+			} `json:"categories,omitempty"`
+		} `json:"limit"`
+		AvailableLimit struct {
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"availableLimit,omitempty"`
+		AuthorizedAmount struct {
+			CurrencyCode string `json:"currencyCode"`
+			Value        string `json:"value"`
+		} `json:"authorizedAmount,omitempty"`
+		ReferenceAccount struct {
+			Iban string `json:"iban"`
+			Bic  string `json:"bic"`
+		} `json:"referenceAccount"`
+		Status struct {
+			Category       string        `json:"category"`
+			LimitationsFor []interface{} `json:"limitationsFor,omitempty"`
+		} `json:"status"`
+		BillingDetails struct {
+			Days         []int  `json:"days"`
+			CalendarType string `json:"calendarType"`
+			Cycle        string `json:"cycle"`
+		} `json:"billingDetails,omitempty"`
+		CreationDate      string `json:"creationDate,omitempty"`
+		FailedPinAttempts int    `json:"failedPinAttempts,omitempty"`
+	} `json:"attributes"`
+	Relationships struct {
+		Owner struct {
+			Data struct {
+				Type string `json:"type"`
+				Id   string `json:"id"`
+			} `json:"data"`
+		} `json:"owner,omitempty"`
+		Legitimates struct {
+			Data []struct {
+				Type string `json:"type"`
+				Id   string `json:"id"`
+			} `json:"data"`
+		} `json:"legitimates,omitempty"`
+	} `json:"relationships"`
+}
+
+type CreditCardTransactions struct {
+	Data []CreditCardTransaction `json:"data"`
+}
+
 type CreditCardTransaction struct {
-	Marked    string    `csv:"Umsatz abgerechnet aber nicht im Saldo enthalten"` // Ignored (for now)
-	ValueDate DkbTime   `csv:"Wertstellung"`
-	Date      DkbTime   `csv:"Belegdatum"`
-	Purpose   string    `csv:"Beschreibung"`
-	Amount    DkbAmount `csv:"Betrag (EUR)"`
-	//OriginalAmount DkbAmount   `csv:"Ursprünglicher Betrag"` // Ignored (for now)
+	Type       string                          `json:"type"`
+	Id         string                          `json:"id"`
+	Attributes CreditCardTransactionAttributes `json:"attributes"`
 }
 
-// GetAccountTransactions returns all transactions in the checking account identified
-// by the provided AccountMetadata between the `from` and `to` times
-func (c *Client) GetAccountTransactions(a AccountMetadata, from time.Time, to time.Time) ([]AccountTransaction, error) {
-	result, err := c.getTransactions(a, from, to)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.parseAccountTransactions(result)
-}
-
-// GetCreditCardTransactions returns all transactions in the credit card account
-// identified by the provided AccountMetadata between the `from` and `to` times
-func (c *Client) GetCreditCardTransactions(a AccountMetadata, from time.Time, to time.Time) ([]CreditCardTransaction, error) {
-	result, err := c.getTransactions(a, from, to)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.parseCreditCardTransactions(result)
-}
-
-func (c *Client) getTransactions(a AccountMetadata, from time.Time, to time.Time) ([]byte, error) {
-	resp, err := c.httpClient.Get("https://www.dkb.de" + a.TransactionLink)
-	if err != nil {
-		return nil, err
-	}
-
-	d, err := goquery.NewDocumentFromReader(resp.Body)
-
-	if err != nil {
-		return nil, err
-	}
-	accountNumber, _ := d.Find("select[name='slAllAccounts'] option[selected='selected']").Attr("value")
-
-	postURL := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze"
-	postData := url.Values{}
-	postData.Add("slTransactionStatus", "0")
-	postData.Add("slSearchPeriod", "1")
-	postData.Add("searchPeriodRadio", "1")
-	postData.Add("transactionDate", from.Format("02.01.2006"))
-	postData.Add("toTransactionDate", to.Format("02.01.2006"))
-	postData.Add("$event", "search")
-	postData.Add("slAllAccounts", accountNumber)
-
-	resp, err = c.httpClient.PostForm(postURL, postData)
-
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Clean this up
-	url := "https://www.dkb.de/banking/finanzstatus/kontoumsaetze?$event=csvExport"
-	if a.AccountType == CreditCard {
-		url = "https://www.dkb.de/banking/finanzstatus/kreditkartenumsaetze?$event=csvExport"
-	}
-	resp, err = c.httpClient.Get(url)
-
-	if err != nil {
-		return nil, err
-	}
-
-	result, err := io.ReadAll(resp.Body)
-
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (c *Client) parseAccountTransactions(transactions []byte) ([]AccountTransaction, error) {
-	var result []AccountTransaction
-
-	r := bufio.NewReader(bytes.NewReader(transactions))
-	skipLines(r, 6) // First six lines consist of metadata
-
-	err := gocsv.Unmarshal(r, &result)
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func (c *Client) parseCreditCardTransactions(transactions []byte) ([]CreditCardTransaction, error) {
-	var result []CreditCardTransaction
-
-	r := bufio.NewReader(bytes.NewReader(transactions))
-	skipLines(r, 6) // First six lines consist of metadata
-
-	err := gocsv.Unmarshal(r, &result)
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func skipLines(r *bufio.Reader, n int) {
-	for i := 0; i < n; i++ {
-		r.ReadLine()
-	}
+type CreditCardTransactionAttributes struct {
+	Amount struct {
+		ConversionRate string `json:"conversionRate"`
+		CurrencyCode   string `json:"currencyCode"`
+		Value          string `json:"value"`
+	} `json:"amount"`
+	CardId         string `json:"cardId"`
+	MerchantAmount struct {
+		CurrencyCode string `json:"currencyCode"`
+		Value        string `json:"value"`
+	} `json:"merchantAmount"`
+	MerchantCategory struct {
+		Code string `json:"code"`
+	} `json:"merchantCategory,omitempty"`
+	Status            string        `json:"status"`
+	TransactionType   string        `json:"transactionType"`
+	AuthorizationDate time.Time     `json:"authorizationDate"`
+	BookingDate       string        `json:"bookingDate"`
+	Description       string        `json:"description"`
+	Bonuses           []interface{} `json:"bonuses"`
 }

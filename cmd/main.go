@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"syscall"
-	"time"
-
 	"github.com/pczora/dkbrobot/pkg/dkbclient"
 	"golang.org/x/term"
+	"os"
+	"strings"
+	"syscall"
 )
 
 func main() {
@@ -31,36 +30,42 @@ func main() {
 
 	c := dkbclient.New()
 
-	err = c.Login(username, password)
+	err = c.Login(username, password, dkbclient.GetMostRecentlyEnrolledMFAMethod)
 	if err != nil {
 		panic(err)
 	}
 
-	accounts, err := c.ParseOverview()
+	//accounts, err := c.GetAccounts()
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//fmt.Printf("%+v", accounts)
+
+	documents, err := c.GetDocuments()
+
 	if err != nil {
 		panic(err)
 	}
 
-	for _, a := range accounts {
-		if a.AccountType == dkbclient.Depot {
-			continue
-		} else if a.AccountType == dkbclient.CheckingAccount {
-			transactions, err := c.GetAccountTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
-			if err != nil {
-				panic(err)
-			}
-			for _, transaction := range transactions {
-				fmt.Println(transaction)
-			}
-		} else if a.AccountType == dkbclient.CreditCard {
-			transactions, err := c.GetCreditCardTransactions(a, time.Now().Add(30*-time.Hour*24), time.Now())
-			if err != nil {
-				panic(err)
-			}
-			for _, transaction := range transactions {
-				fmt.Printf("%+v\n", transaction)
-			}
+	for _, d := range documents.Data {
+		fmt.Printf("%+v\n", d)
+		data, err := c.GetDocumentData(d.ID)
+		if err != nil {
+			panic(err)
 		}
+
+		filename := d.Attributes.FileName
+		if !strings.HasSuffix(filename, ".pdf") {
+			filename = filename + ".pdf"
+		}
+
+		f, err := os.Create(filename)
+		if err != nil {
+			panic(err)
+		}
+		f.Write(data)
+		f.Close()
 
 	}
 
